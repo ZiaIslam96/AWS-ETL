@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Lambda functions to perform ETL processes and load into Redshift
+Resources:
+  EtlLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/ScopePermissions
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonSQSFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+      Policies:
+        - PolicyName: LambdaLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: LambdaSSMPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                Resource: "*"
+  EtlLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${NamePrefix}-etl-lambda
+      Runtime: python3.9
+      Timeout: 500
+      Handler: app.etl_lambda.lambda_handler
+      Role: !GetAtt EtlLambdaFunctionRole.Arn
+      Code: .deployment/lambda-package.zip
+      Layers:
+        - arn:aws:lambda:eu-west-1:123980920791:layer:python_39_psycopg2_layer:1
+      Environment:
+        Variables:
+          IP_API_ENDPOINT: !Ref IpApiEndpointParameter
+      
+  LoadLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${NamePrefix}-load-lambda
+      Runtime: python3.9
+      Timeout: 500
+      Handler: app.load_lambda.lambda_handler
+      Role: !GetAtt EtlLambdaFunctionRole.Arn
+      Code: .deployment/lambda-package.zip
+      ReservedConcurrentExecutions: 1
+      Layers:
+        - arn:aws:lambda:eu-west-1:123980920791:layer:python_39_psycopg2_layer:1
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: "network-infra-VPCSGID"
+        SubnetIds:
+          - Fn::ImportValue: !Sub "network-infra-PrivateSubnet0ID"
+  
+  LoadLambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt LoadQueue.Arn
+      FunctionName: !GetAtt LoadLambdaFunction.Arn
+    
+
+
+  LoadQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${NamePrefix}-load-queue
+      DelaySeconds: 0
+      VisibilityTimeout: 500
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt LoadDeadLetterQueue.Arn
+        maxReceiveCount: 10
+
+  LoadDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${NamePrefix}-load-queue-dlq
+  
+  CafeTransformedDatabucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: group3-cafe-datatrans-bucket
+  
+  
+  CafeDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: group3-cafe-data-bucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt EtlLambdaFunction.Arn
+  S3BucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref EtlLambdaFunction
+      Principal: s3.amazonaws.com
+      SourceArn: "arn:aws:s3:::group3-cafe-data-bucket"
